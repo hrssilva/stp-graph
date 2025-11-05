@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""
+STP Benchmark: Empirical complexity of Simple Temporal Problem (STP) consistency
+
+Implements:
+  - STP instance generation (sparse/dense, consistent or not)
+  - Bellman–Ford consistency check (O(VE))
+  - Floyd–Warshall consistency check (O(V^3)) for comparison
+  - Benchmark harness with CSV output and plots
+
+Usage (defaults are sensible):
+  python stp_benchmark.py
+  python stp_benchmark.py --repeats 5 --density-sparse 0.05 --density-dense 0.8
+  python stp_benchmark.py --sparse-sizes 100 200 400 800 1200 --dense-sizes 40 60 80 100 140
+  python stp_benchmark.py --csv stp_results.csv
+  python stp_benchmark.py --no-plots
+"""
+
+from __future__ import annotations
+import argparse
+import math
+import random
+import sys
+import time
+from typing import List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+try:
+    import matplotlib.pyplot as plt
+    _HAVE_MPL = True
+except Exception:
+    _HAVE_MPL = False
+
+Edge = Tuple[int, int, float]  # (u, v, w) encodes constraint: x_v - x_u <= w as edge u->v weight w
+
+
+# -----------------------------
+# STP generation
+# -----------------------------
+def gen_stp_instance(
+    n_vertices: int,
+    *,
+    density: float = 0.2,
+    weight_range: Tuple[float, float] = (-10.0, 10.0),
+    ensure_consistent: bool = True,
+    seed: Optional[int] = None,
+) -> List[Edge]:
+    """
+    Generate a random STP instance over variables 0..n-1.
+    Each constraint x_v - x_u <= w is represented as directed edge u->v with weight w.
+
+    If ensure_consistent=True, we sample a feasible potential p and relax edges so that
+    w >= p[v] - p[u], guaranteeing consistency (no negative cycles).
+    If ensure_consistent=False, we inject a random negative 3-cycle (if possible).
+    """
+    rng = random.Random(seed)
+    edges: List[Edge] = []
+    for u in range(n_vertices):
+        for v in range(n_vertices):
+            if u == v:
+                continue
+            if rng.random() < density:
+                w = rng.uniform(*weight_range)
+                edges.append((u, v, w))
+
+    if ensure_consistent:
+        # Enforce feasibility using random potentials p
+        p = [rng.uniform(-5, 5) for _ in range(n_vertices)]
+        new_edges = []
+        for u, v, w in edges:
+            feasible_w = max(w, p[v] - p[u])
+            new_edges.append((u, v, feasible_w))
+        edges = new_edges
+    else:
+        # Try to create a definite negative cycle (forces inconsistency)
+        if n_vertices >= 3:
+            K = abs(weight_range[0]) + abs(weight_range[1]) + 5.0
+            a, b, c = rng.sample(range(n_vertices), 3)
+            edges.append((a, b, -K))
+            edges.append((b, c, -K))
+            edges.append((c, a, -K))
+    return edges
+
+
+# -----------------------------
+# Consistency via shortest paths
+# -----------------------------
+def bellman_ford_consistency(n: int, edges: List[Edge]) -> Tuple[bool, Optional[List[float]]]:
+    """
+    Bellman–Ford based consistency check.
+    Initialize dist[v]=0 (equivalent to super-source s->v weight 0).
+    After V-1 relaxations, if any edge can still relax -> negative cycle -> inconsistent.
+
+    Returns: (is_consistent, distances_if_consistent_else_None)
+    Time: O(VE), Space: O(V)
+    """
+    dist = [0.0] * n  # super-source trick
+    for _ in range(n - 1):
+        updated = False
+        for u, v, w in edges:
+            nd = dist[u] + w
+            if dist[v] > nd:
+                dist[v] = nd
+                updated = True
+        if not updated:
+            break
+    # Detect negative cycle (allow small epsilon due to floats)
+    eps = 1e-15
+    for u, v, w in edges:
+        if (dist[v] - (dist[u] + w)) > eps:
+            return (False, None)
+    return (True, dist)
+
+
+def floyd_warshall_consistency(n: int, edges: List[Edge]) -> Tuple[bool, Optional[List[List[float]]]]:
+    """
+    Floyd–Warshall all-pairs closure for STP (O(V^3), O(V^2) space).
+    Inconsistency if any diagonal d[i][i] < 0 after closure.
+    """
+    INF = 1e18
+    d = [[0.0 if i == j else INF for j in range(n)] for i in range(n)]
+    for u, v, w in edges:
+        if w < d[u][v]:
+            d[u][v] = w
+    for k in range(n):
+        dk = d[k]
+        for i in range(n):
+            dik = d[i][k]
+            if dik == INF:
+                continue
+            di = d[i]
+            # Tight inner loop
+            for j in range(n):
+                alt = dik + dk[j]
+                if alt < di[j]:
+                    di[j] = alt
+    for i in range(n):
+        if d[i][i] < 0:
+            return (False, None)
+    return (True, d)
+
+
+# -----------------------------
+# Benchmark harness
+# -----------------------------
+def benchmark_suite(
+    v_sizes_sparse: List[int],
+    v_sizes_dense: List[int],
+    *,
+    density_sparse: float = 0.05,
+    density_dense: float = 0.8,
+    repeats: int = 3,
+    seed: int = 42,
+    max_fw_n: int = 350,
+) -> pd.DataFrame:
+    """
+    For each V in sparse/dense regimes, generate 'repeats' random consistent STPs,
+    measure Bellman–Ford and (optionally) Floyd–Warshall runtimes, and record VE.
+    """
+    rng = random.Random(seed)
+    rows = []
+    for regime, sizes, density in [('sparse', v_sizes_sparse, density_sparse),
+                                   ('dense', v_sizes_dense, density_dense)]:
+        for n in sizes:
+            for _ in range(repeats):
+                edges = gen_stp_instance(n, density=density, ensure_consistent=True,
+                                         seed=rng.randint(0, 10**9))
+                E = len(edges)
+
+                # Bellman–Ford
+                t0 = time.perf_counter()
+                ok_bf, _ = bellman_ford_consistency(n, edges)
+                t1 = time.perf_counter()
+
+                # Floyd–Warshall (for comparison; limited n)
+                fw_time = math.nan
+                ok_fw = None
+                if n <= max_fw_n:
+                    t2 = time.perf_counter()
+                    ok_fw, _ = floyd_warshall_consistency(n, edges)
+                    t3 = time.perf_counter()
+                    fw_time = t3 - t2
+
+                rows.append({
+                    'regime': regime,
+                    'V': n,
+                    'E': E,
+                    'VE': n * E,
+                    'bf_time_s': t1 - t0,
+                    'fw_time_s': fw_time,
+                    'bf_ok': ok_bf,
+                    'fw_ok': ok_fw
+                })
+    return pd.DataFrame(rows)
+
+
+def plot_results(df: pd.DataFrame, title_prefix: str = "STP") -> None:
+    if not _HAVE_MPL:
+        print("[warn] matplotlib not available; skipping plots.", file=sys.stderr)
+        return
+
+    # 1) Bellman–Ford runtime vs V*E
+    plt.figure()
+    plt.scatter(df['VE'], df['bf_time_s'], s=18)
+    plt.xlabel("V * E (driver for O(VE))")
+    plt.ylabel("Bellman–Ford runtime (s)")
+    plt.title(f"{title_prefix}: Bellman–Ford runtime ~ O(VE)")
+    plt.tight_layout()
+    plt.show()
+
+    # 2) Sparse regime: time vs V and vs E
+    df_sparse = df[df['regime'] == 'sparse'].groupby('V', as_index=False).agg(
+        {'bf_time_s': 'median', 'E': 'median', 'VE': 'median'}
+    )
+    if not df_sparse.empty:
+        plt.figure()
+        plt.plot(df_sparse['V'], df_sparse['bf_time_s'], marker='o')
+        plt.xlabel("V (sparse, E≈c·V)")
+        plt.ylabel("Median BF runtime (s)")
+        plt.title(f"{title_prefix}: Sparse → ~O(V^2)")
+        plt.tight_layout()
+        plt.show()
+
+        plt.figure()
+        plt.plot(df_sparse['E'], df_sparse['bf_time_s'], marker='o')
+        plt.xlabel("E (sparse)")
+        plt.ylabel("Median BF runtime (s)")
+        plt.title(f"{title_prefix}: Sparse runtime vs E")
+        plt.tight_layout()
+        plt.show()
+
+    # 3) Dense regime: time vs V
+    df_dense = df[df['regime'] == 'dense'].groupby('V', as_index=False).agg(
+        {'bf_time_s': 'median', 'E': 'median', 'VE': 'median'}
+    )
+    if not df_dense.empty:
+        plt.figure()
+        plt.plot(df_dense['V'], df_dense['bf_time_s'], marker='o')
+        plt.xlabel("V (dense, E≈Θ(V^2))")
+        plt.ylabel("Median BF runtime (s)")
+        plt.title(f"{title_prefix}: Dense → ~O(V^3)")
+        plt.tight_layout()
+        plt.show()
+
+    # 4) BF vs FW where both ran
+    df_both = df[~df['fw_time_s'].isna()].groupby(['regime', 'V'], as_index=False).agg(
+        {'bf_time_s': 'median', 'fw_time_s': 'median', 'E': 'median'}
+    )
+    if not df_both.empty:
+        for regime in ['sparse', 'dense']:
+            sub = df_both[df_both['regime'] == regime]
+            if sub.empty:
+                continue
+            plt.figure()
+            plt.plot(sub['V'], sub['bf_time_s'], marker='o', label='Bellman–Ford')
+            plt.plot(sub['V'], sub['fw_time_s'], marker='x', label='Floyd–Warshall')
+            plt.xlabel(f"V ({regime})")
+            plt.ylabel("Median runtime (s)")
+            plt.title(f"{title_prefix}: {regime.capitalize()} — BF (O(VE)) vs FW (O(V^3))")
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Benchmark STP consistency algorithms (Bellman–Ford vs Floyd–Warshall).")
+    p.add_argument('--sparse-sizes', type=int, nargs='+', default=[100, 200, 400, 800, 1200],
+                   help='V sizes for sparse regime (default: 100 200 400 800 1200)')
+    p.add_argument('--dense-sizes', type=int, nargs='+', default=[40, 60, 80, 100, 140, 180],
+                   help='V sizes for dense regime (default: 40 60 80 100 140 180)')
+    p.add_argument('--density-sparse', type=float, default=0.05, help='Edge density for sparse regime (default 0.05)')
+    p.add_argument('--density-dense', type=float, default=0.8, help='Edge density for dense regime (default 0.8)')
+    p.add_argument('--repeats', type=int, default=3, help='Repeats per (regime,V) point (default 3)')
+    p.add_argument('--max-fw-n', type=int, default=350, help='Max V for running Floyd–Warshall (default 350)')
+    p.add_argument('--seed', type=int, default=42, help='RNG seed (default 42)')
+    p.add_argument('--csv', type=str, default='stp_benchmarks.csv', help='Output CSV path (default stp_benchmarks.csv)')
+    p.add_argument('--no-plots', action='store_true', help='Skip plotting')
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    df = benchmark_suite(
+        args.sparse_sizes,
+        args.dense_sizes,
+        density_sparse=args.density_sparse,
+        density_dense=args.density_dense,
+        repeats=args.repeats,
+        seed=args.seed,
+        max_fw_n=args.max_fw_n,
+    )
+
+    # Write CSV
+    df.to_csv(args.csv, index=False)
+    print(f"[ok] wrote results to {args.csv} with {len(df)} rows")
+
+    # Print quick summary
+    for regime in ['sparse', 'dense']:
+        sub = df[df['regime'] == regime]
+        if sub.empty:
+            continue
+        Vuniq = sorted(sub['V'].unique().tolist())
+        print(f"Regime={regime} V={Vuniq} — median BF time (s) by V:")
+        med = sub.groupby('V')['bf_time_s'].median()
+        for v in Vuniq:
+            print(f"  V={v:5d}  BF median: {med.loc[v]:.6f}s")
+
+    # Plots
+    if not args.no_plots:
+        plot_results(df, title_prefix="STP Consistency")
+
+
+if __name__ == '__main__':
+    main()
+
