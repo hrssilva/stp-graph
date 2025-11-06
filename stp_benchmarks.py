@@ -42,6 +42,12 @@ try:
 except Exception:
     _HAVE_NUMBA = False
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 Edge = Tuple[int, int, float]  # (u, v, w) encodes constraint: x_v - x_u <= w as edge u->v weight w
 
 
