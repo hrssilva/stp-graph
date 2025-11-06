@@ -28,11 +28,19 @@ from typing import List, Tuple, Optional
 import numpy as np
 import pandas as pd
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 try:
     import matplotlib.pyplot as plt
     _HAVE_MPL = True
 except Exception:
     _HAVE_MPL = False
+
+try:
+    import numba as _numba
+    _HAVE_NUMBA = True
+except Exception:
+    _HAVE_NUMBA = False
 
 Edge = Tuple[int, int, float]  # (u, v, w) encodes constraint: x_v - x_u <= w as edge u->v weight w
 
@@ -164,6 +172,53 @@ def bellman_ford_consistency(n: int, edges: List[Edge], strict=True) -> Tuple[bo
             return (False, None)
     return (True, dist)
 
+def _edges_to_arrays(edges: List[Edge]):
+    """Convert list[(u,v,w)] -> three contiguous NumPy arrays (int32,int32,float64)."""
+    m = len(edges)
+    u = np.empty(m, dtype=np.int32)
+    v = np.empty(m, dtype=np.int32)
+    w = np.empty(m, dtype=np.float64)
+    for i, (uu, vv, ww) in enumerate(edges):
+        u[i] = uu; v[i] = vv; w[i] = ww
+    return u, v, w
+
+if _HAVE_NUMBA:
+    @_numba.njit(cache=True, fastmath=False)
+    def _bf_numba(n: int, u: np.ndarray, v: np.ndarray, w: np.ndarray, strict: int):
+        """
+        Numba BF. strict=1 forces exactly V-1 passes; strict=0 allows early stop.
+        Returns (ok_flag, dist).
+        """
+        dist = np.zeros(n, dtype=np.float64)  # super-source trick
+        m = w.size
+        for it in range(n - 1):
+            updated = False
+            for i in range(m):
+                nd = dist[u[i]] + w[i]
+                if nd < dist[v[i]]:
+                    dist[v[i]] = nd
+                    updated = True
+            if (strict == 0) and (not updated):
+                break
+
+        # negative cycle check
+        eps = 1e-10
+        for i in range(m):
+            if dist[u[i]] + w[i] + eps < dist[v[i]]:
+                return False, dist
+        return True, dist
+
+def bellman_ford_consistency_fast(n: int, edges: List[Edge], strict: bool = True):
+    """
+    Prefer Numba BF if available, else fall back to Python BF.
+    NOTE: this wrapper keeps conversion out of the timed region (call it *before* timing if you want).
+    """
+    if _HAVE_NUMBA:
+        u, v, w = _edges_to_arrays(edges)
+        ok, dist = _bf_numba(n, u, v, w, 1 if strict else 0)
+        return ok, dist
+    else:
+        return bellman_ford_consistency(n, edges, strict=strict)
 
 def floyd_warshall_consistency(n: int, edges: List[Edge]) -> Tuple[bool, Optional[List[List[float]]]]:
     """
@@ -175,6 +230,8 @@ def floyd_warshall_consistency(n: int, edges: List[Edge]) -> Tuple[bool, Optiona
     """
     INF = math.inf
     d = [[0.0 if i == j else INF for j in range(n)] for i in range(n)]
+    #d = np.full((n, n), INF, dtype=float)
+    #np.fill_diagonal(d, 0.0)
     for u, v, w in edges:
         if w < d[u][v]:
             d[u][v] = w
@@ -202,10 +259,126 @@ def floyd_warshall_consistency(n: int, edges: List[Edge]) -> Tuple[bool, Optiona
             return (False, None)
     return (True, d)
 
+def floyd_warshall_consistency_numpy(n: int, edges: List[Edge]) -> Tuple[bool, Optional[np.ndarray]]:
+    """
+    NumPy-broadcasted Floyd–Warshall:
+      d = min(d, d[:,k,None] + d[None,k,:]) for k in 0..n-1
+    Much faster than pure Python loops for moderate n.
+    """
+    INF = np.inf
+    d = np.full((n, n), INF, dtype=float)
+    np.fill_diagonal(d, 0.0)
+    # set edges
+    for u, v, w in edges:
+        if w < d[u, v]:
+            d[u, v] = w
+    # closure
+    for k in range(n):
+        # alt distances through k
+        alt = d[:, k][:, None] + d[k, :][None, :]
+        np.minimum(d, alt, out=d)
+    # detect negative cycles with small tolerance
+    if np.any(np.diag(d) < -1e-10):
+        return (False, None)
+    return (True, d)
 
 # -----------------------------
 # Benchmark harness
 # -----------------------------
+
+def _bench_job(regime: str,
+               n: int,
+               density: float,
+               max_fw_n: int,
+               seed_base: int,
+               job_seq: int) -> dict:
+    rng = random.Random((hash(regime) & 0xffffffff) ^ seed_base ^ (n * 0x9e3779b1) ^ job_seq)
+    edge_seed = rng.randint(0, 10**9)
+
+    edges = gen_stp_interval_instance(
+        n, density=density, ensure_consistent=True, seed=edge_seed
+    )
+    E = len(edges)
+
+    # ---- BF (use numba if present) ----
+    t0 = time.perf_counter()
+    ok_bf, _ = bellman_ford_consistency(n, edges, strict=True)
+    t1 = time.perf_counter()
+
+    # ---- FW (NumPy path if possible) ----
+    fw_time = math.nan
+    ok_fw = None
+    if n <= max_fw_n:
+        t2 = time.perf_counter()
+        if np is not None:
+            ok_fw, _ = floyd_warshall_consistency(n, edges)
+        else:
+            ok_fw, _ = floyd_warshall_consistency(n, edges)
+        t3 = time.perf_counter()
+        fw_time = t3 - t2
+
+    return {
+        'regime': regime,
+        'V': n,
+        'E': E,
+        'VE': n * E,
+        'bf_time_s': t1 - t0,
+        'fw_time_s': fw_time,
+        'bf_ok': ok_bf,
+        'fw_ok': ok_fw
+    }
+
+
+# def benchmark_suite(
+#     v_sizes_sparse: List[int],
+#     v_sizes_dense: List[int],
+#     *,
+#     density_sparse: float = 0.05,
+#     density_dense: float = 0.8,
+#     repeats: int = 3,
+#     seed: int = 42,
+#     max_fw_n: int = 350,
+# ) -> pd.DataFrame:
+#     """
+#     For each V in sparse/dense regimes, generate 'repeats' random consistent STPs,
+#     measure Bellman–Ford and (optionally) Floyd–Warshall runtimes, and record VE.
+#     """
+#     rng = random.Random(seed)
+#     rows = []
+#     for regime, sizes, density in [('sparse', v_sizes_sparse, density_sparse),
+#                                    ('dense', v_sizes_dense, density_dense)]:
+#         for n in sizes:
+#             edges = gen_stp_interval_instance(n, density=density, ensure_consistent=True,
+#                                          seed=rng.randint(0, 10**9))
+#             E = len(edges)
+#             for _ in range(repeats):
+
+#                 # Bellman–Ford
+#                 t0 = time.perf_counter()
+#                 ok_bf, _ = bellman_ford_consistency(n, edges)
+#                 t1 = time.perf_counter()
+
+#                 # Floyd–Warshall (for comparison; limited n)
+#                 fw_time = math.nan
+#                 ok_fw = None
+#                 if n <= max_fw_n:
+#                     t2 = time.perf_counter()
+#                     ok_fw, _ = floyd_warshall_consistency(n, edges)
+#                     t3 = time.perf_counter()
+#                     fw_time = t3 - t2
+
+#                 rows.append({
+#                     'regime': regime,
+#                     'V': n,
+#                     'E': E,
+#                     'VE': n * E,
+#                     'bf_time_s': t1 - t0,
+#                     'fw_time_s': fw_time,
+#                     'bf_ok': ok_bf,
+#                     'fw_ok': ok_fw
+#                 })
+#     return pd.DataFrame(rows)
+
 def benchmark_suite(
     v_sizes_sparse: List[int],
     v_sizes_dense: List[int],
@@ -215,49 +388,36 @@ def benchmark_suite(
     repeats: int = 3,
     seed: int = 42,
     max_fw_n: int = 350,
+    max_workers: Optional[int] = None,   # NEW
 ) -> pd.DataFrame:
     """
-    For each V in sparse/dense regimes, generate 'repeats' random consistent STPs,
-    measure Bellman–Ford and (optionally) Floyd–Warshall runtimes, and record VE.
+    Fully parallel: each (regime, V, repetition) is an independent process job.
+    Reproducible via seed; each job generates its own instance.
     """
-    rng = random.Random(seed)
-    rows = []
+    jobs = []
     for regime, sizes, density in [('sparse', v_sizes_sparse, density_sparse),
-                                   ('dense', v_sizes_dense, density_dense)]:
+                                   ('dense',  v_sizes_dense,  density_dense)]:
         for n in sizes:
-            edges = gen_stp_interval_instance(n, density=density, ensure_consistent=True,
-                                         seed=rng.randint(0, 10**9))
-            E = len(edges)
-            for _ in range(repeats):
+            for r in range(repeats):
+                # job_seq only used to vary the per-job RNG seed deterministically
+                jobs.append((regime, n, density, max_fw_n, seed, r + 1))
 
-                # Bellman–Ford
-                t0 = time.perf_counter()
-                ok_bf, _ = bellman_ford_consistency(n, edges)
-                t1 = time.perf_counter()
+    # Sequential fallback if requested
+    if max_workers == 1:
+        rows = [_bench_job(*args) for args in jobs]
+        return pd.DataFrame(rows)
 
-                # Floyd–Warshall (for comparison; limited n)
-                fw_time = math.nan
-                ok_fw = None
-                if n <= max_fw_n:
-                    t2 = time.perf_counter()
-                    ok_fw, _ = floyd_warshall_consistency(n, edges)
-                    t3 = time.perf_counter()
-                    fw_time = t3 - t2
+    if max_workers is None:
+        max_workers = os.cpu_count() or 1
 
-                rows.append({
-                    'regime': regime,
-                    'V': n,
-                    'E': E,
-                    'VE': n * E,
-                    'bf_time_s': t1 - t0,
-                    'fw_time_s': fw_time,
-                    'bf_ok': ok_bf,
-                    'fw_ok': ok_fw
-                })
+    rows = []
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_bench_job, *args) for args in jobs]
+        for fut in as_completed(futures):
+            rows.append(fut.result())
     return pd.DataFrame(rows)
 
-
-def plot_results(df: pd.DataFrame, title_prefix: str = "STP", base_path="./plots") -> None:
+def plot_results(df: pd.DataFrame, title_prefix: str = "STP", base_path="./plots", show_plots=False) -> None:
     if not _HAVE_MPL:
         print("[warn] matplotlib not available; skipping plots.", file=sys.stderr)
         return
@@ -269,7 +429,7 @@ def plot_results(df: pd.DataFrame, title_prefix: str = "STP", base_path="./plots
     plt.ylabel("Bellman–Ford runtime (s)")
     plt.title(f"{title_prefix}: Bellman–Ford runtime ~ O(VE)")
     plt.tight_layout()
-    plt.show()
+    if show_plots: plt.show()
     plt.savefig(os.path.join(base_path, "bf_runtime.png"))
 
     # 2) Sparse regime: time vs V and vs E
@@ -284,7 +444,7 @@ def plot_results(df: pd.DataFrame, title_prefix: str = "STP", base_path="./plots
         plt.title(f"{title_prefix}: Sparse → ~O(V^2)")
         plt.tight_layout()
         plt.savefig(os.path.join(base_path, "bf_sparse.png"))
-        plt.show()
+        if show_plots: plt.show()
 
         plt.figure()
         plt.plot(df_sparse['E'], df_sparse['bf_time_s'], marker='o')
@@ -293,7 +453,7 @@ def plot_results(df: pd.DataFrame, title_prefix: str = "STP", base_path="./plots
         plt.title(f"{title_prefix}: Sparse runtime vs E")
         plt.tight_layout()
         plt.savefig(os.path.join(base_path, "bf_sparse_vs_e.png"))
-        plt.show()
+        if show_plots: plt.show()
 
     # 3) Dense regime: time vs V
     df_dense = df[df['regime'] == 'dense'].groupby('V', as_index=False).agg(
@@ -307,7 +467,7 @@ def plot_results(df: pd.DataFrame, title_prefix: str = "STP", base_path="./plots
         plt.title(f"{title_prefix}: Dense → ~O(V^3)")
         plt.tight_layout()
         plt.savefig(os.path.join(base_path, "bf_dense.png"))
-        plt.show()
+        if show_plots: plt.show()
 
     # 4) BF vs FW where both ran
     df_both = df[~df['fw_time_s'].isna()].groupby(['regime', 'V'], as_index=False).agg(
@@ -327,9 +487,9 @@ def plot_results(df: pd.DataFrame, title_prefix: str = "STP", base_path="./plots
             plt.legend()
             plt.tight_layout()
             plt.savefig(os.path.join(base_path, f"bf_fw_{regime}.png"))
-            plt.show()
+            if show_plots: plt.show()
 
-def plot_theoretical_comparisons(df: pd.DataFrame, title_prefix: str = "STP", base_path="./plots") -> None:
+def plot_theoretical_comparisons(df: pd.DataFrame, title_prefix: str = "STP", base_path="./plots", show_plots = False) -> None:
     if not _HAVE_MPL:
         print("[warn] matplotlib not available; skipping theoretical plots.", file=sys.stderr)
         return
@@ -366,6 +526,7 @@ def plot_theoretical_comparisons(df: pd.DataFrame, title_prefix: str = "STP", ba
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(base_path, f"theory_compare_{regime}.png"))
+        if show_plots: plt.show()
         plt.close()
 
         plt.figure()
@@ -378,6 +539,7 @@ def plot_theoretical_comparisons(df: pd.DataFrame, title_prefix: str = "STP", ba
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(base_path, f"theory_compare_ve_v3_{regime}.png"))
+        if show_plots: plt.show()
         plt.close()
 
     # ----- 2. Normalized runtime ratios -----
@@ -415,9 +577,9 @@ def plot_theoretical_comparisons(df: pd.DataFrame, title_prefix: str = "STP", ba
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Benchmark STP consistency algorithms (Bellman–Ford vs Floyd–Warshall).")
     p.add_argument('--sparse-sizes', type=int, nargs='+', default=[40, 60, 80, 100, 140, 180, 220, 260, 300, 340],
-                   help='V sizes for sparse regime (default: 100 200 400 800 1200)')
+                   help='V sizes for sparse regime (default: 40 60 80 100 140 180 220 260 300 340)')
     p.add_argument('--dense-sizes', type=int, nargs='+', default=[40, 60, 80, 100, 140, 180, 220, 260, 300, 340],
-                   help='V sizes for dense regime (default: 40 60 80 100 140 180)')
+                   help='V sizes for dense regime (default: 40 60 80 100 140 180 220 260 300 340)')
     p.add_argument('--density-sparse', type=float, default=0.05, help='Edge density for sparse regime (default 0.05)')
     p.add_argument('--density-dense', type=float, default=0.8, help='Edge density for dense regime (default 0.8)')
     p.add_argument('--repeats', type=int, default=3, help='Repeats per (regime,V) point (default 3)')
@@ -425,6 +587,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--seed', type=int, default=42, help='RNG seed (default 42)')
     p.add_argument('--csv', type=str, default='stp_benchmarks.csv', help='Output CSV path (default stp_benchmarks.csv)')
     p.add_argument('--no-plots', action='store_true', help='Skip plotting')
+    p.add_argument('--no-show', action='store_true', help='Skip displaying plots')
+    p.add_argument('--workers', type=int, default=None, help='Max parallel processes (default: all cores)')
+    p.add_argument('--plots-dir', type=str, default='./plots', help='Directory to write plots (default: ./plots)')
     return p.parse_args()
 
 
@@ -432,13 +597,13 @@ def main():
     args = parse_args()
 
     df = benchmark_suite(
-        args.sparse_sizes,
-        args.dense_sizes,
+        args.sparse_sizes, args.dense_sizes,
         density_sparse=args.density_sparse,
         density_dense=args.density_dense,
         repeats=args.repeats,
         seed=args.seed,
         max_fw_n=args.max_fw_n,
+        max_workers=args.workers
     )
 
     # Write CSV
@@ -458,8 +623,10 @@ def main():
 
     # Plots
     if not args.no_plots:
-        plot_results(df, title_prefix="STP Consistency")
-        plot_theoretical_comparisons(df, title_prefix="STP Consistency")
+        # Make sure plot directory exists
+        os.makedirs(args.plots_dir, exist_ok=True)
+        plot_results(df, title_prefix="STP Consistency", base_path=args.plots_dir, show_plots= not args.no_show)
+        plot_theoretical_comparisons(df, title_prefix="STP Consistency", base_path=args.plots_dir, show_plots= not args.no_show)
 
 
 if __name__ == '__main__':
