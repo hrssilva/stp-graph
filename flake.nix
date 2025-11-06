@@ -19,10 +19,14 @@
         python313
         python313Packages.pip
         python313Packages.venvShellHook
+        python313Packages.pandas
+        python313Packages.numpy
         pyright
       ];
 
       postShellHook = ''
+        export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib.outPath}/lib:$LD_LIBRARY_PATH"
+        export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib/:/run/opengl-driver/lib/"
         echo "$(python --version)"
       '';
       postVenvCreation = ''
