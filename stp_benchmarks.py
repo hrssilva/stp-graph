@@ -22,7 +22,6 @@ import random
 import sys
 import os
 import time
-import psutils
 from typing import List, Tuple, Optional
 
 import numpy as np
@@ -250,7 +249,6 @@ def _bench_job(
     use_numpy: bool
 ) -> dict:
     E = len(edges)
-    proc = psutil.Process(os.getpid())
 
     
     # ---- BF (NumPy path if possible)  ----

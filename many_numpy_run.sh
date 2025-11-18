@@ -15,15 +15,14 @@ done
 sizes="${arr[@]}"
 
 
-python stp_benchmarks.py --max-fw-n 9999999\
-    --repeats 5 \
+python stp_benchmarks.py --use-numpy --max-fw-n 9999999\
+    --repeats 3 \
     --density-dense 0.95 \
     --dense-sizes $sizes \
     --sparse-sizes $sizes \
-    --csv "concurrent_many/stp_benchmarks.csv"
+    --csv "concurrent_many_numpy/stp_benchmarks.csv"
 
 python stp_plots.py \
-    --csv "concurrent_many/stp_benchmarks.csv" \
-    --plots-dir "concurrent_many"
-
+    --csv "concurrent_many_numpy/stp_benchmarks.csv" \
+    --plots-dir "concurrent_many_numpy"
 

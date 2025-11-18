@@ -1,260 +1,423 @@
 #!/usr/bin/env python3
 """
-Plotting utilities and CLI for STP benchmark results.
+STP plotting tool focused on the core comparisons requested:
 
-Typical usage:
-  # 1) Run benchmarks and write CSV
-  python stp_benchmark.py --csv stp_benchmarks.csv
-
-  # 2) Generate plots from that CSV
-  python stp_plots.py --csv stp_benchmarks.csv --plots-dir ./plots
+- Bellman–Ford vs Floyd–Warshall runtimes as V changes (linear + log plots)
+- Runtime distributions to show run-to-run variance
+- Measured runtimes vs theoretical complexity for each algorithm (linear + log)
 """
 
 from __future__ import annotations
+
 import argparse
 import os
 import sys
-from typing import Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
 try:
     import matplotlib.pyplot as plt
+
     _HAVE_MPL = True
 except Exception:
     _HAVE_MPL = False
 
+_REGIME_COLORS: Dict[str, str] = {
+    "sparse": "tab:blue",
+    "dense": "tab:orange",
+}
 
-def plot_results(
-    df: pd.DataFrame,
-    title_prefix: str = "STP",
-    base_path: str = "./plots",
-    show_plots: bool = False,
-) -> None:
-    if not _HAVE_MPL:
-        print("[warn] matplotlib not available; skipping plots.", file=sys.stderr)
+
+def _format_regime_label(regime: str) -> str:
+    """Return a human-readable label for a regime."""
+    if not regime:
+        return "Unknown"
+    txt = str(regime).strip()
+    return txt.capitalize() if txt else "Unknown"
+
+
+def _regime_color(regime: str) -> str | None:
+    """Pick a consistent color per regime (case-insensitive)."""
+    if not regime:
+        return None
+    return _REGIME_COLORS.get(str(regime).strip().lower())
+
+
+def _regime_slug(regime: str) -> str:
+    """Slugified regime name for filenames."""
+    if not regime:
+        return "unknown"
+    slug = "".join(c if c.isalnum() else "_" for c in str(regime).strip().lower())
+    slug = slug.strip("_")
+    return slug or "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _save(path_no_ext: str) -> None:
+    """Save the current figure as PNG+SVG and close it."""
+    plt.tight_layout()
+    plt.savefig(path_no_ext + ".png", dpi=180)
+    plt.savefig(path_no_ext + ".svg")
+    plt.close()
+
+
+def _prep_axes(logx: bool = False, logy: bool = False) -> None:
+    """Apply consistent axes configuration."""
+    ax = plt.gca()
+    if logx:
+        ax.set_xscale("log")
+    if logy:
+        ax.set_yscale("log")
+    ax.minorticks_on()
+    ax.grid(True, which="both", alpha=0.25)
+
+
+def _annotate_label(label: str, log_scale: bool) -> str:
+    """Append '(log scale)' when plotting on a logarithmic axis."""
+    if log_scale and "log scale" not in label.lower():
+        return f"{label} (log scale)"
+    return label
+
+
+def _format_v_label(v: float) -> str:
+    """Pretty formatting for V values in labels."""
+    if pd.isna(v):
+        return "?"
+    try:
+        vf = float(v)
+        if float(vf).is_integer():
+            return str(int(vf))
+        return f"{vf:.3g}"
+    except Exception:
+        return str(v)
+
+
+def _mean_time_by_v(df: pd.DataFrame, time_col: str, include_E: bool = False) -> pd.DataFrame:
+    """Return per-(regime,V) mean runtime (and optional mean E) for a timing column."""
+    if time_col not in df.columns:
+        return pd.DataFrame(columns=["regime", "V", "mean_time"])
+
+    sub = df[df[time_col].notna()].copy()
+    if sub.empty or "V" not in sub.columns:
+        return pd.DataFrame(columns=["regime", "V", "mean_time"])
+
+    sub = sub[sub["V"].notna()]
+    if sub.empty:
+        return pd.DataFrame(columns=["regime", "V", "mean_time"])
+
+    if "regime" in sub.columns:
+        sub["regime"] = sub["regime"].fillna("unknown").astype(str)
+    else:
+        sub["regime"] = "all"
+
+    agg_dict: Dict[str, Tuple[str, str]] = {"mean_time": (time_col, "mean")}
+    if include_E and "E" in sub.columns:
+        agg_dict["mean_E"] = ("E", "mean")
+
+    grouped = (
+        sub.groupby(["regime", "V"], sort=True)
+        .agg(**agg_dict)
+        .reset_index()
+        .sort_values(["regime", "V"])
+    )
+    return grouped
+
+
+# ---------------------------------------------------------------------------
+# Plotting primitives
+# ---------------------------------------------------------------------------
+def plot_time_vs_v(df: pd.DataFrame, base_path: str, title_prefix: str, show_plots: bool) -> None:
+    """Plot BF vs FW runtimes against V (linear + log) split by regime."""
+    configs: List[Tuple[str, str, str]] = [
+        ("Bellman–Ford", "bf_time_s", "o-"),
+        ("Floyd–Warshall", "fw_time_s", "s--"),
+    ]
+
+    series: List[Tuple[str, str, pd.DataFrame]] = []
+    for label, col, style in configs:
+        stats = _mean_time_by_v(df, col)
+        if stats.empty:
+            continue
+        series.append((label, style, stats))
+
+    if not series:
+        print("[warn] No runtime data for BF or FW; skipping time vs V plots.", file=sys.stderr)
         return
 
-    # 1) Bellman–Ford runtime vs V*E
-    plt.figure()
-    plt.scatter(df['VE'], df['bf_time_s'], s=18)
-    plt.xlabel("V * E (driver for O(VE))")
-    plt.ylabel("Bellman–Ford runtime (s)")
-    plt.title(f"{title_prefix}: Bellman–Ford runtime ~ O(VE)")
-    plt.tight_layout()
-    if show_plots:
-        plt.show()
-    plt.savefig(os.path.join(base_path, "bf_runtime.png"))
-
-    # 2) Sparse regime: time vs V and vs E
-    df_sparse = df[df['regime'] == 'sparse'].groupby('V', as_index=False).agg(
-        {'bf_time_s': 'median', 'E': 'median', 'VE': 'median'}
-    )
-    if not df_sparse.empty:
+    for log_scale, suffix in [(False, "linear"), (True, "log")]:
         plt.figure()
-        plt.plot(df_sparse['V'], df_sparse['bf_time_s'], marker='o')
-        plt.xlabel("V (sparse, E≈c·V)")
-        plt.ylabel("Median BF runtime (s)")
-        plt.title(f"{title_prefix}: Sparse → ~O(V^2)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(base_path, "bf_sparse.png"))
+        for label, style, stats in series:
+            for regime, sub in stats.groupby("regime"):
+                sub = sub.sort_values("V")
+                if sub.empty:
+                    continue
+                if log_scale:
+                    sub_plot = sub[(sub["V"] > 0) & (sub["mean_time"] > 0)]
+                    if sub_plot.empty:
+                        continue
+                else:
+                    sub_plot = sub
+                color = _regime_color(regime)
+                regime_label = _format_regime_label(regime)
+                kwargs = {"label": f"{label} ({regime_label})"}
+                if color:
+                    kwargs["color"] = color
+                plt.plot(
+                    sub_plot["V"],
+                    sub_plot["mean_time"],
+                    style,
+                    **kwargs,
+                )
+
+        logx = logy = log_scale
+        _prep_axes(logx=logx, logy=logy)
+        plt.xlabel(_annotate_label("V", logx))
+        plt.ylabel(_annotate_label("Mean runtime (s)", logy))
+        plt.title(f"{title_prefix}: BF vs FW — Time vs V ({suffix})")
+        plt.legend()
+        _save(os.path.join(base_path, f"time_vs_V_{suffix}"))
         if show_plots:
             plt.show()
 
-        plt.figure()
-        plt.plot(df_sparse['E'], df_sparse['bf_time_s'], marker='o')
-        plt.xlabel("E (sparse)")
-        plt.ylabel("Median BF runtime (s)")
-        plt.title(f"{title_prefix}: Sparse runtime vs E")
-        plt.tight_layout()
-        plt.savefig(os.path.join(base_path, "bf_sparse_vs_e.png"))
-        if show_plots:
-            plt.show()
 
-    # 3) Dense regime: time vs V
-    df_dense = df[df['regime'] == 'dense'].groupby('V', as_index=False).agg(
-        {'bf_time_s': 'median', 'E': 'median', 'VE': 'median'}
-    )
-    if not df_dense.empty:
-        plt.figure()
-        plt.plot(df_dense['V'], df_dense['bf_time_s'], marker='o')
-        plt.xlabel("V (dense, E≈Θ(V^2))")
-        plt.ylabel("Median BF runtime (s)")
-        plt.title(f"{title_prefix}: Dense → ~O(V^3)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(base_path, "bf_dense.png"))
-        if show_plots:
-            plt.show()
+def plot_runtime_distributions(df: pd.DataFrame, base_path: str, title_prefix: str, show_plots: bool) -> None:
+    """Box plots showing runtime variance for median/maximum V per regime."""
+    configs = [
+        ("Bellman–Ford", "bf_time_s", "bf_runtime_distribution"),
+        ("Floyd–Warshall", "fw_time_s", "fw_runtime_distribution"),
+    ]
 
-    # 4) BF vs FW where both ran
-    df_both = df[~df['fw_time_s'].isna()].groupby(['regime', 'V'], as_index=False).agg(
-        {'bf_time_s': 'median', 'fw_time_s': 'median', 'E': 'median'}
-    )
-    if not df_both.empty:
-        for regime in ['sparse', 'dense']:
-            sub = df_both[df_both['regime'] == regime]
-            if sub.empty:
+    for label, col, filename in configs:
+        if col not in df.columns or "V" not in df.columns:
+            continue
+
+        sub = df[df[col].notna()].copy()
+        if sub.empty:
+            continue
+
+        if "regime" in sub.columns:
+            sub["regime"] = sub["regime"].fillna("unknown").astype(str)
+        else:
+            sub["regime"] = "all"
+
+        data = []
+        labels = []
+        colors = []
+
+        for regime in sorted(sub["regime"].unique()):
+            sub_reg = sub[sub["regime"] == regime]
+            unique_vs = np.sort(sub_reg["V"].dropna().unique())
+            if unique_vs.size == 0:
                 continue
-            plt.figure()
-            plt.plot(sub['V'], sub['bf_time_s'], marker='o', label='Bellman–Ford')
-            plt.plot(sub['V'], sub['fw_time_s'], marker='x', label='Floyd–Warshall')
-            plt.xlabel(f"V ({regime})")
-            plt.ylabel("Median runtime (s)")
-            plt.title(f"{title_prefix}: {regime.capitalize()} — BF (O(VE)) vs FW (O(V^3))")
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(os.path.join(base_path, f"bf_fw_{regime}.png"))
-            if show_plots:
-                plt.show()
+            largest_v = unique_vs[-1]
+            median_v = unique_vs[unique_vs.size // 2]
+            for v in sorted({median_v, largest_v}):
+                vals = sub_reg[sub_reg["V"] == v][col].dropna()
+                if vals.empty:
+                    continue
+                data.append(vals)
+                labels.append(f"{_format_regime_label(regime)} V={_format_v_label(v)}")
+                colors.append(_regime_color(regime))
 
+        if not data:
+            continue
 
-def plot_theoretical_comparisons(
-    df: pd.DataFrame,
-    title_prefix: str = "STP",
-    base_path: str = "./plots",
-    show_plots: bool = False,
-) -> None:
-    if not _HAVE_MPL:
-        print("[warn] matplotlib not available; skipping theoretical plots.", file=sys.stderr)
-        return
+        plt.figure()
+        bp = plt.boxplot(data, labels=labels, showmeans=True, patch_artist=True)
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color or "lightgray")
 
-    # Filter only BF (FW is always O(V^3))
-    df_bf = df.copy()
-    df_bf = df_bf[df_bf['bf_time_s'].notna()].copy()
-    df_bf['VE_theory'] = df_bf['V'] * df_bf['E']
-    df_bf['V3_theory'] = df_bf['V'] ** 3
-
-    # Normalize to compare constants
-    df_bf['bf_per_VE'] = df_bf['bf_time_s'] / df_bf['VE_theory']
-    df_bf['bf_per_V3'] = df_bf['bf_time_s'] / df_bf['V3_theory']
-
-    # ----- 1. Empirical vs. theoretical curves (scaled) -----
-    for regime in ['sparse', 'dense']:
-        sub = df_bf[df_bf['regime'] == regime].groupby('V', as_index=False).agg(
-            {
-                'bf_time_s': 'median',
-                'E': 'median',
-                'VE_theory': 'median',
-                'V3_theory': 'median',
-            }
+        _prep_axes(logx=False, logy=False)
+        plt.ylabel("Runtime (s)")
+        plt.title(
+            f"{title_prefix}: {label} runtime distribution (median/max V per regime)"
         )
-        if sub.empty:
-            continue
-
-        # Fit constants k1, k2 to overlay theoretical curves
-        k_VE = np.median(sub['bf_time_s'] / sub['VE_theory'])
-        k_V3 = np.median(sub['bf_time_s'] / sub['V3_theory'])
-
-        plt.figure()
-        plt.plot(sub['V'], sub['bf_time_s'], 'o-', label='Empirical BF')
-        plt.plot(sub['V'], k_VE * sub['V'] * sub['E'], '--', label=f'k·V·E (k={k_VE:.2e})')
-        plt.plot(sub['V'], k_V3 * (sub['V'] ** 3), ':', label=f'k·V³ (k={k_V3:.2e})')
-        plt.xlabel("V")
-        plt.ylabel("Runtime (s)")
-        plt.title(f"{title_prefix}: {regime.capitalize()} — Empirical vs. Theoretical")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(base_path, f"theory_compare_{regime}.png"))
+        _save(os.path.join(base_path, filename))
         if show_plots:
             plt.show()
-        plt.close()
 
-        plt.figure()
-        plt.plot(sub['V'], sub['V'] * sub['E'], '--', label='V·E')
-        plt.plot(sub['V'], (sub['V'] ** 3), ':', label='V³')
-        plt.plot(sub['V'], (sub['V'] * sub['V']), 'o-', label='V²')
-        plt.xlabel("V")
-        plt.ylabel("Runtime (s)")
-        plt.title(f"{title_prefix}: {regime.capitalize()} — Empirical vs. Theoretical")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(base_path, f"theory_compare_ve_v3_{regime}.png"))
-        if show_plots:
-            plt.show()
-        plt.close()
 
-    # ----- 2. Normalized runtime ratios -----
-    plt.figure()
-    for regime, style in [('sparse', 'o-'), ('dense', 's--')]:
-        sub = df_bf[df_bf['regime'] == regime]
-        if sub.empty:
+def plot_measured_vs_theory(df: pd.DataFrame, base_path: str, title_prefix: str, show_plots: bool) -> None:
+    """Compare empirical runtimes against theoretical complexity (linear + log)."""
+    configs = [
+        {
+            "name": "Bellman–Ford",
+            "time_col": "bf_time_s",
+            "needs_E": True,
+            "complexity": "O(V·E)",
+            "filename": "bf_vs_theory",
+            "theory": lambda stats: stats["V"] * stats["mean_E"],
+        },
+        {
+            "name": "Floyd–Warshall",
+            "time_col": "fw_time_s",
+            "needs_E": False,
+            "complexity": "O(V³)",
+            "filename": "fw_vs_theory",
+            "theory": lambda stats: stats["V"] ** 3,
+        },
+    ]
+
+    for cfg in configs:
+        stats = _mean_time_by_v(
+            df,
+            cfg["time_col"],
+            include_E=cfg["needs_E"],
+        )
+        if stats.empty:
             continue
-        plt.plot(sub['V'], sub['bf_per_VE'], style, label=f'{regime}: time/(V·E)')
-    plt.xlabel("V")
-    plt.ylabel("time / (V·E)")
-    plt.title(f"{title_prefix}: Normalized by O(VE)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(base_path, "bf_per_VE.png"))
-    plt.close()
 
-    plt.figure()
-    for regime, style in [('sparse', 'o-'), ('dense', 's--')]:
-        sub = df_bf[df_bf['regime'] == regime]
-        if sub.empty:
+        if cfg["needs_E"] and "mean_E" not in stats.columns:
+            print(f"[warn] Missing edge data for {cfg['name']}; skipping theoretical comparison.", file=sys.stderr)
             continue
-        plt.plot(sub['V'], sub['bf_per_V3'], style, label=f'{regime}: time/V³')
-    plt.xlabel("V")
-    plt.ylabel("time / V³")
-    plt.title(f"{title_prefix}: Normalized by O(V³)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(base_path, "bf_per_V3.png"))
-    plt.close()
+
+        for regime, stats_regime in stats.groupby("regime"):
+            stats_regime = stats_regime.sort_values("V")
+            if stats_regime.empty:
+                continue
+
+            if cfg["needs_E"] and stats_regime["mean_E"].isna().all():
+                continue
+
+            theory_raw = cfg["theory"](stats_regime).astype(float)
+            stats_regime = stats_regime.assign(theory_raw=theory_raw)
+            stats_regime = stats_regime.dropna(subset=["mean_time", "theory_raw", "V"])
+            if stats_regime.empty:
+                continue
+
+            safe_theory = stats_regime["theory_raw"].replace(0, np.nan)
+            ratio = stats_regime["mean_time"] / safe_theory
+            scale = np.nanmedian(ratio.replace([np.inf, -np.inf], np.nan))
+            if not np.isfinite(scale):
+                scale = 1.0
+            stats_regime = stats_regime.assign(theory_scaled=stats_regime["theory_raw"] * scale)
+
+            regime_label = _format_regime_label(regime)
+            regime_slug = _regime_slug(regime)
+
+            for log_scale, suffix in [(False, "linear"), (True, "log")]:
+                if log_scale:
+                    mask = (
+                        (stats_regime["V"] > 0)
+                        & (stats_regime["mean_time"] > 0)
+                        & (stats_regime["theory_scaled"] > 0)
+                    )
+                    stats_plot = stats_regime[mask]
+                    if stats_plot.empty:
+                        print(
+                            f"[warn] No positive-valued data for {cfg['name']} ({regime_label}) log plot; skipping.",
+                            file=sys.stderr,
+                        )
+                        continue
+                else:
+                    stats_plot = stats_regime
+
+                plt.figure()
+                color = _regime_color(regime)
+                measured_kwargs = {"label": f"Measured runtime ({regime_label})"}
+                theory_kwargs = {"label": f"Scaled {cfg['complexity']} ({regime_label})"}
+                if color:
+                    measured_kwargs["color"] = color
+                    theory_kwargs["color"] = color
+                plt.plot(
+                    stats_plot["V"],
+                    stats_plot["mean_time"],
+                    "o-",
+                    **measured_kwargs,
+                )
+                plt.plot(
+                    stats_plot["V"],
+                    stats_plot["theory_scaled"],
+                    "--",
+                    **theory_kwargs,
+                )
+                logx = logy = log_scale
+                _prep_axes(logx=logx, logy=logy)
+                plt.xlabel(_annotate_label("V", logx))
+                plt.ylabel(_annotate_label("Runtime (s)", logy))
+                plt.title(
+                    f"{title_prefix}: {cfg['name']} vs {cfg['complexity']} — {regime_label} ({suffix})"
+                )
+                plt.legend()
+                filename = f"{cfg['filename']}_{regime_slug}_{suffix}"
+                _save(os.path.join(base_path, filename))
+                if show_plots:
+                    plt.show()
 
 
-# -----------------------------
-# CLI for plotting module
-# -----------------------------
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Generate plots for STP benchmarks from a CSV file.",
+    parser = argparse.ArgumentParser(
+        description="Generate BF/FW comparison plots from STP benchmark CSV data.",
     )
-    p.add_argument(
-        '--csv', type=str, default='stp_benchmarks.csv',
-        help='Input CSV file with benchmark results (default: stp_benchmarks.csv)',
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default="stp_benchmarks.csv",
+        help="Input CSV file with benchmark results (default: stp_benchmarks.csv)",
     )
-    p.add_argument(
-        '--plots-dir', type=str, default='./plots',
-        help='Directory to write plots (default: ./plots)',
+    parser.add_argument(
+        "--plots-dir",
+        type=str,
+        default="./plots",
+        help="Directory to store generated plots (default: ./plots)",
     )
-    p.add_argument(
-        '--no-show', action='store_true',
-        help='Do not display plots interactively (only save to files)',
+    parser.add_argument(
+        "--no-show",
+        action="store_true",
+        help="Do not display plots interactively.",
     )
-    p.add_argument(
-        '--title-prefix', type=str, default='STP Consistency',
-        help='Prefix for plot titles (default: "STP Consistency")',
+    parser.add_argument(
+        "--title-prefix",
+        type=str,
+        default="STP Comparison",
+        help='Prefix for plot titles (default: "STP Comparison")',
     )
-    return p.parse_args()
+    return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
 
     if not os.path.exists(args.csv):
         print(f"[error] CSV file not found: {args.csv}", file=sys.stderr)
         sys.exit(1)
 
-    df = pd.read_csv(args.csv)
-    os.makedirs(args.plots_dir, exist_ok=True)
+    if not _HAVE_MPL:
+        print("[error] matplotlib is not available in this environment.", file=sys.stderr)
+        sys.exit(1)
 
+    df = pd.read_csv(args.csv)
+    missing = [c for c in ["V", "bf_time_s", "fw_time_s", "E", "regime"] if c not in df.columns]
+    if missing:
+        print(f"[info] Missing columns in CSV: {', '.join(missing)} (plots requiring them will be skipped).", file=sys.stderr)
+
+    for col in ("V", "E"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ("bf_time_s", "fw_time_s"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "regime" in df.columns:
+        df["regime"] = df["regime"].fillna("unknown").astype(str)
+    else:
+        print("[warn] 'regime' column missing; treating all rows as a single regime.", file=sys.stderr)
+        df["regime"] = "all"
+
+    os.makedirs(args.plots_dir, exist_ok=True)
     show = not args.no_show
 
-    plot_results(
-        df,
-        title_prefix=args.title_prefix,
-        base_path=args.plots_dir,
-        show_plots=show,
-    )
-    plot_theoretical_comparisons(
-        df,
-        title_prefix=args.title_prefix,
-        base_path=args.plots_dir,
-        show_plots=show,
-    )
+    plot_time_vs_v(df, args.plots_dir, args.title_prefix, show)
+    plot_runtime_distributions(df, args.plots_dir, args.title_prefix, show)
+    plot_measured_vs_theory(df, args.plots_dir, args.title_prefix, show)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
